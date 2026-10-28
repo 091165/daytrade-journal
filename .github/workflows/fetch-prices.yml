@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - 'data/*.csv'
+      - 'data/*.json'
+      - 'data/notes/*.json'
+      - 'scripts/build-index.mjs'
       - 'scripts/fetch-prices.mjs'
       - 'scripts/rename-csvs.mjs'
       - '.github/workflows/fetch-prices.yml'
@@ -56,6 +59,14 @@ jobs:
             echo "No new price data"
           else
             git commit -m "🤖 Auto-update price data"
+          fi
+
+      - name: Build data index
+        run: |
+          node scripts/build-index.mjs
+          git add data/index.json
+          if ! git diff --staged --quiet; then
+            git commit -m "🤖 Update data index"
           fi
 
       - name: Push all changes

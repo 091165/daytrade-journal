@@ -1,0 +1,147 @@
+[
+  {
+    "date": "2026-04-24",
+    "csv": true,
+    "notes": "data/notes/2026-04-24.json"
+  },
+  {
+    "date": "2026-04-27",
+    "csv": true,
+    "notes": "data/notes/2026-04-27.json"
+  },
+  {
+    "date": "2026-04-28",
+    "csv": true,
+    "notes": "data/notes/2026-04-28.json"
+  },
+  {
+    "date": "2026-04-30",
+    "csv": true,
+    "notes": "data/notes/2026-04-30.json"
+  },
+  {
+    "date": "2026-05-01",
+    "csv": true,
+    "notes": "data/notes/2026-05-01.json"
+  },
+  {
+    "date": "2026-05-07",
+    "csv": true,
+    "notes": "data/notes/2026-05-07.json"
+  },
+  {
+    "date": "2026-05-08",
+    "csv": true,
+    "notes": "data/notes/2026-05-08.json"
+  },
+  {
+    "date": "2026-05-11",
+    "csv": true,
+    "notes": "data/notes/2026-05-11.json"
+  },
+  {
+    "date": "2026-05-12",
+    "csv": true,
+    "notes": "data/notes/2026-05-12.json"
+  },
+  {
+    "date": "2026-05-13",
+    "csv": true,
+    "notes": "data/notes/2026-05-13.json"
+  },
+  {
+    "date": "2026-05-14",
+    "csv": true,
+    "notes": "data/notes/2026-05-14.json"
+  },
+  {
+    "date": "2026-05-15",
+    "csv": true,
+    "notes": "data/notes/2026-05-15.json"
+  },
+  {
+    "date": "2026-05-18",
+    "csv": true,
+    "notes": "data/notes/2026-05-18.json"
+  },
+  {
+    "date": "2026-05-19",
+    "csv": true,
+    "notes": "data/notes/2026-05-19.json"
+  },
+  {
+    "date": "2026-05-20",
+    "csv": true,
+    "notes": "data/notes/2026-05-20.json"
+  },
+  {
+    "date": "2026-05-21",
+    "csv": true,
+    "notes": "data/notes/2026-05-21.json"
+  },
+  {
+    "date": "2026-05-22",
+    "csv": true,
+    "notes": "data/notes/2026-05-22.json"
+  },
+  {
+    "date": "2026-05-25",
+    "csv": true,
+    "notes": "data/notes/2026-05-25.json"
+  },
+  {
+    "date": "2026-05-26",
+    "csv": true,
+    "notes": "data/notes/2026-05-26.json"
+  },
+  {
+    "date": "2026-06-01",
+    "csv": true,
+    "notes": "data/notes/2026-06-01.json"
+  },
+  {
+    "date": "2026-06-02",
+    "csv": true,
+    "notes": "data/notes/2026-06-02.json"
+  },
+  {
+    "date": "2026-06-03",
+    "csv": true,
+    "notes": "data/notes/2026-06-03.json"
+  },
+  {
+    "date": "2026-06-04",
+    "csv": true,
+    "notes": "data/notes/2026-06-04.json"
+  },
+  {
+    "date": "2026-06-05",
+    "csv": true,
+    "notes": "data/2026-06-05.json"
+  },
+  {
+    "date": "2026-06-08",
+    "csv": true,
+    "notes": "data/2026-06-08.json"
+  },
+  {
+    "date": "2026-06-09",
+    "csv": true,
+    "notes": "data/2026-06-09.json"
+  },
+  {
+    "date": "2026-08-03",
+    "csv": true,
+    "notes": "data/2026-08-03.json"
+  },
+  {
+    "date": "2026-10-27",
+    "csv": true,
+    "notes": "data/2026-10-27.json"
+  },
+  {
+    "date": "2026-10-28",
+    "csv": true,
+    "notes": "data/2026-10-28.json"
+  }
+]
