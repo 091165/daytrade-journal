@@ -506,7 +506,7 @@ function CumulativeChart({ cumulative }) {
         <line x1={margin.left} y1={yZero} x2={margin.left + chartW} y2={yZero}
           stroke="rgba(255,255,255,0.15)" strokeWidth="1" strokeDasharray="3,3" />
         <path d={linePath} fill="none" stroke="#94a3b8" strokeWidth="1.5" />
-        {[0, Math.floor(cumulative.length / 2), cumulative.length - 1].map(i => (
+        {[...new Set([0, Math.floor(cumulative.length / 2), cumulative.length - 1])].map(i => (
           <text key={i} x={xFor(i)} y={margin.top + chartH + 14}
             fill="#64748b" fontSize="9.5" textAnchor="middle" fontFamily="ui-monospace, monospace">
             {cumulative[i].date.slice(5)}
