@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trade Patterns</title>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.9/babel.min.js"></script>
+<style>
+  body { margin: 0; background: #080d18; font-family: 'Hiragino Sans','Noto Sans JP',sans-serif; }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .fade-up { animation: fadeUp 0.5s ease-out backwards; }
+</style>
+</head>
+<body>
+<div id="root"><div style="color:#64748b;text-align:center;padding:80px 16px;font-family:'Hiragino Sans',sans-serif;">読み込み中...</div></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+// 承認・試用銘柄（daytrade の trading_rules と合わせる）
+const APPROVED = ['5803', '9984'];
+const TRIAL = ['6981'];
+const END_TIME = '10:00';
+const DAILY_LOSS_LIMIT = 10000;
+
+async function fetchJSON(url) {
+  try {
+    const r = await fetch(url);
+    return r.ok ? await r.json() : null;
+  } catch { return null; }
+}
+
+const toMin = (hm) => parseInt(hm.slice(0, 2)) * 60 + parseInt(hm.slice(3, 5));
+
+// 振り返りメモの実質トレード（時刻つき）を1日の中で並べ、順番・直前の結果を付ける
+function prepareTrades(daysData) {
+  const all = [];
+  daysData.forEach(({ date, realTrades }) => {
+    const list = [];
+    Object.entries(realTrades).forEach(([code, ts]) => ts.forEach(t => {
+      if (t.openTime && t.qty) list.push({ ...t, code, date });
+    }));
+    list.sort((a, b) => a.openTime.localeCompare(b.openTime));
+    let cum = 0, last = null;
+    list.forEach((t, i) => {
+      t.nth = i + 1;
+      t.cumBefore = cum;
+      t.afterLoss = last !== null && last < 0;
+      t.p100 = t.pnl * 100 / t.qty;
+      t.hold = t.closeTime ? toMin(t.closeTime) - toMin(t.openTime) : null;
+      cum += t.pnl; last = t.pnl;
+    });
+    all.push(...list);
+  });
+  return all;
+}
+
+// 勝率の差の検定（2群の比率の差・正規近似）。p値を返す
+function pDiff(a, b) {
+  if (a.length < 5 || b.length < 5) return null;
+  const wa = a.filter(t => t.pnl > 0).length, wb = b.filter(t => t.pnl > 0).length;
+  const p = (wa + wb) / (a.length + b.length);
+  const se = Math.sqrt(p * (1 - p) * (1 / a.length + 1 / b.length));
+  if (!se) return null;
+  const z = Math.abs(wa / a.length - wb / b.length) / se;
+  // 標準正規の両側p値 = erfc(z/√2)（Numerical Recipes の近似式）
+  const x = z / Math.SQRT2;
+  const tt = 1 / (1 + 0.5 * x);
+  const erfc = tt * Math.exp(-x * x - 1.26551223 + tt * (1.00002368 + tt * (0.37409196 + tt * (0.09678418 +
+    tt * (-0.18628806 + tt * (0.27886807 + tt * (-1.13520398 + tt * (1.48851587 + tt * (-0.82215223 + tt * 0.17087277)))))))));
+  return erfc;
+}
+
+function stats(list) {
+  if (!list.length) return null;
+  const wins = list.filter(t => t.pnl > 0).length;
+  const sum100 = list.reduce((s, t) => s + t.p100, 0);
+  return {
+    n: list.length, winRate: wins / list.length,
+    avg100: sum100 / list.length,
+    total: list.reduce((s, t) => s + t.pnl, 0),
+    big: list.filter(t => t.pnl <= -5000).length,
+  };
+}
+
+const BREAKDOWNS = [
+  {
+    title: '直前の取引の結果', note: '負けた直後の取引は、取り返したい気持ちで質が落ちやすい',
+    groups: [
+      ['直前が勝ち・トントン', t => t.nth > 1 && !t.afterLoss],
+      ['直前が負け', t => t.afterLoss],
+    ],
+  },
+  {
+    title: '株数',
+    groups: [
+      ['100株', t => t.qty <= 100],
+      ['200〜300株', t => t.qty > 100 && t.qty <= 300],
+      ['400株以上', t => t.qty > 300],
+    ],
+  },
+  {
+    title: '建てた時刻',
+    groups: [
+      ['09:00〜09:04', t => t.openTime < '09:05'],
+      ['09:05〜09:14', t => t.openTime >= '09:05' && t.openTime < '09:15'],
+      ['09:15〜09:29', t => t.openTime >= '09:15' && t.openTime < '09:30'],
+      ['09:30〜09:59', t => t.openTime >= '09:30' && t.openTime < '10:00'],
+      ['10:00以降', t => t.openTime >= '10:00'],
+    ],
+  },
+  {
+    title: '保有時間', note: '負けを早く切ると短い保有に負けが集まるので、因果ではなく傾向として見る',
+    groups: [
+      ['1分以内', t => t.hold !== null && t.hold <= 1],
+      ['2〜3分', t => t.hold !== null && t.hold >= 2 && t.hold <= 3],
+      ['4〜9分', t => t.hold !== null && t.hold >= 4 && t.hold <= 9],
+      ['10〜29分', t => t.hold !== null && t.hold >= 10 && t.hold < 30],
+      ['30分以上', t => t.hold !== null && t.hold >= 30],
+    ],
+  },
+  {
+    title: 'その日の何回目',
+    groups: [
+      ['1回目', t => t.nth === 1],
+      ['2〜3回目', t => t.nth >= 2 && t.nth <= 3],
+      ['4〜6回目', t => t.nth >= 4 && t.nth <= 6],
+      ['7回目以降', t => t.nth >= 7],
+    ],
+  },
+  {
+    title: '方向',
+    groups: [
+      ['買い', t => t.direction === 'buy'],
+      ['売り', t => t.direction === 'sell'],
+    ],
+  },
+  {
+    title: '銘柄',
+    groups: [
+      ['承認（フジクラ・SBG）', t => APPROVED.includes(t.code)],
+      ['試用（村田）', t => TRIAL.includes(t.code)],
+      ['それ以外', t => !APPROVED.includes(t.code) && !TRIAL.includes(t.code)],
+    ],
+  },
+];
+
+// ルールを当てはめたら：10時前だけ・1日-1万円で終了 を共通にして、追加のルールを比べる
+const SIMULATIONS = [
+  ['今のルール（10時前・-1万円で終了）', () => true],
+  ['＋ 負けたらその日は終了', (t, s) => s.losses === 0],
+  ['＋ 2連敗で終了', (t, s) => s.streak < 2],
+  ['＋ 09:05〜09:14は入らない', t => !(t.openTime >= '09:05' && t.openTime < '09:15')],
+];
+
+function simulate(trades, extra) {
+  const byDay = {};
+  trades.forEach(t => (byDay[t.date] ||= []).push(t));
+  let total = 0, worst = 0, n = 0, wins = 0;
+  Object.values(byDay).forEach(list => {
+    const s = { pnl: 0, losses: 0, streak: 0 };
+    for (const t of list) {
+      if (t.openTime >= END_TIME || s.pnl <= -DAILY_LOSS_LIMIT) continue;
+      if (!extra(t, s)) continue;
+      s.pnl += t.p100; n += 1;
+      if (t.pnl > 0) wins += 1;
+      if (t.pnl < 0) { s.losses += 1; s.streak += 1; } else s.streak = 0;
+    }
+    total += s.pnl; worst = Math.min(worst, s.pnl);
+  });
+  return { n, total, worst, winRate: n ? wins / n : 0 };
+}
+
+function fmtPnL(n) {
+  if (n == null) return '--';
+  return (n >= 0 ? '+' : '') + Math.round(n).toLocaleString();
+}
+const pct = (x) => `${Math.round(x * 100)}%`;
+const tone = (x) => (x >= 0 ? '#4ade80' : '#fb7185');
+
+function App() {
+  const [trades, setTrades] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    async function load() {
+      const index = await fetchJSON('data/index.json');
+      if (!index) { setError('取引日の一覧（data/index.json）を読み込めませんでした'); return; }
+      const days = await Promise.all(index.filter(d => d.notes).map(async d => {
+        const notes = await fetchJSON(d.notes);
+        return notes?.realTrades ? { date: d.date, realTrades: notes.realTrades } : null;
+      }));
+      setTrades(prepareTrades(days.filter(Boolean)));
+    }
+    load().catch(e => setError(String(e)));
+  }, []);
+
+  const view = useMemo(() => {
+    if (!trades) return null;
+    const breakdowns = BREAKDOWNS.map(b => {
+      const groups = b.groups.map(([label, f]) => ({ label, list: trades.filter(f) })).filter(g => g.list.length);
+      // 一番良い群と一番悪い群の勝率の差が偶然かどうか
+      const ranked = [...groups].filter(g => g.list.length >= 5).sort((x, y) => stats(y.list).winRate - stats(x.list).winRate);
+      const p = ranked.length >= 2 ? pDiff(ranked[0].list, ranked[ranked.length - 1].list) : null;
+      return { ...b, groups, p };
+    });
+    const sims = SIMULATIONS.map(([label, f]) => ({ label, ...simulate(trades, f) }));
+    const days = new Set(trades.map(t => t.date)).size;
+    return { breakdowns, sims, days };
+  }, [trades]);
+
+  if (error) return <Page><div style={{ color: '#fb7185', fontSize: 13, padding: 20 }}>{error}</div></Page>;
+  if (!view) return <div style={{ color: '#64748b', textAlign: 'center', padding: '80px 16px' }}>読み込み中...</div>;
+
+  const all = stats(trades);
+  return (
+    <Page>
+      <div className="fade-up" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, marginBottom: 22 }}>
+        <KPI label="時刻つきの取引" value={`${all.n}件`} sub={`${view.days}日分`} />
+        <KPI label="勝率" value={pct(all.winRate)} sub="全取引" />
+        <KPI label="1回平均（100株換算）" value={fmtPnL(all.avg100)} sub="円" tone={all.avg100 >= 0 ? 'good' : 'bad'} />
+        <KPI label="-5,000円以下の負け" value={`${all.big}回`} sub="実額" tone="bad" />
+      </div>
+
+      <Card title="🧪 ルールを当てはめたら（10時前の取引・100株換算）" delay="0.1s">
+        <div style={{ fontSize: 11, color: '#64748b', marginBottom: 8 }}>過去の取引に後からルールを当てはめた試算。同じデータで探したルールは良く見えやすいので、目安として見る</div>
+        {view.sims.map((s, i) => (
+          <Row key={s.label} first={i === 0}
+            left={<><div style={{ fontSize: 12.5, fontWeight: 600 }}>{s.label}</div>
+              <div style={{ fontSize: 10, color: '#475569' }}>{s.n}回 ／ 勝率{pct(s.winRate)} ／ 最悪の日 {fmtPnL(s.worst)}円</div></>}
+            right={<span style={{ fontSize: 14, fontWeight: 700, fontFamily: 'ui-monospace, monospace', color: tone(s.total) }}>{fmtPnL(s.total)}円</span>} />
+        ))}
+      </Card>
+
+      {view.breakdowns.map((b, bi) => (
+        <Card key={b.title} title={`📊 ${b.title}`} delay={`${0.15 + bi * 0.04}s`}
+          action={b.p != null && <span style={{ fontSize: 10, color: b.p < 0.05 ? '#fbbf24' : '#475569' }}>
+            {b.p < 0.05 ? '★ 差は偶然ではなさそう' : '差は偶然の範囲'}（p={b.p.toFixed(3)}）</span>}>
+          {b.note && <div style={{ fontSize: 10.5, color: '#64748b', marginBottom: 6 }}>{b.note}</div>}
+          {b.groups.map((g, i) => {
+            const s = stats(g.list);
+            return (
+              <Row key={g.label} first={i === 0}
+                left={<><span style={{ fontSize: 13, fontWeight: 600 }}>{g.label}</span>
+                  <span style={{ fontSize: 10, color: '#475569', marginLeft: 8 }}>{s.n}回 ／ 勝率{pct(s.winRate)} ／ -5千以下{s.big}回</span></>}
+                right={<span style={{ fontSize: 12, fontFamily: 'ui-monospace, monospace', textAlign: 'right' }}>
+                  <span style={{ color: tone(s.avg100), fontWeight: 700 }}>平均 {fmtPnL(s.avg100)}</span>
+                  <span style={{ color: '#64748b', marginLeft: 8 }}>実額 {fmtPnL(s.total)}</span>
+                </span>} />
+            );
+          })}
+        </Card>
+      ))}
+
+      <div style={{ fontSize: 10, color: '#475569', lineHeight: 1.7 }}>
+        ・振り返りメモ（data/日付.json）の実質トレードのうち、時刻と株数があるものを集計しています。<br />
+        ・「平均」は100株あたりに換算した1回の損益、「実額」は実際の損益の合計です。<br />
+        ・p値は、一番良い群と一番悪い群の勝率の差が偶然で起きる確率の目安です（0.05未満で★）。群が多い項目ほど偶然の差も出やすいので、★がギリギリのものは今後のデータで確かめてください。
+      </div>
+    </Page>
+  );
+}
+
+function Page({ children }) {
+  return (
+    <div style={{ background: 'radial-gradient(ellipse at top, #0f1729 0%, #080d18 60%)', minHeight: '100vh', padding: '20px 16px 60px', color: '#e2e8f0' }}>
+      <div style={{ maxWidth: 760, margin: '0 auto' }}>
+        <div style={{ display: 'flex', gap: 14, marginBottom: 10, fontSize: 11 }}>
+          <a href="./" style={{ color: '#475569', textDecoration: 'none' }}>← トップ</a>
+          <a href="month.html" style={{ color: '#475569', textDecoration: 'none' }}>月次</a>
+          <a href="review.html" style={{ color: '#475569', textDecoration: 'none' }}>ルール遵守</a>
+        </div>
+        <div className="fade-up" style={{ paddingBottom: 14, marginBottom: 20, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+          <div style={{ fontSize: 9.5, color: '#475569', letterSpacing: 4, marginBottom: 4 }}>MY PATTERNS</div>
+          <div style={{ fontSize: 20, fontWeight: 700, letterSpacing: -0.3 }}>自分の勝ちパターン・負けパターン</div>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Card({ title, delay, action, children }) {
+  return (
+    <div className="fade-up" style={{ animationDelay: delay, marginBottom: 22 }}>
+      <div style={{ background: 'linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0.005))', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 14, padding: 14 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
+          <div style={{ fontSize: 10, color: '#475569', letterSpacing: 2, fontWeight: 700 }}>{title}</div>
+          {action}
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Row({ left, right, first }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap', padding: '8px 0', borderTop: first ? 'none' : '1px solid rgba(255,255,255,0.04)' }}>
+      <div>{left}</div>
+      {right}
+    </div>
+  );
+}
+
+function KPI({ label, value, sub, tone }) {
+  const color = tone === 'good' ? '#4ade80' : tone === 'bad' ? '#fb7185' : '#e2e8f0';
+  return (
+    <div style={{ background: 'linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.01))', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 14, padding: '12px 14px' }}>
+      <div style={{ fontSize: 10, color: '#64748b', marginBottom: 4, letterSpacing: 0.5 }}>{label}</div>
+      <div style={{ fontSize: 19, fontWeight: 700, color, fontFamily: 'ui-monospace, monospace', lineHeight: 1.1 }}>{value}</div>
+      <div style={{ fontSize: 9.5, color: '#475569', marginTop: 3 }}>{sub}</div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
