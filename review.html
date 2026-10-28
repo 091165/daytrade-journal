@@ -132,8 +132,25 @@ function evaluateDay(checks, csv, realTrades) {
   const total = csv ? csv.closes.reduce((s, t) => s + t.pnl, 0) : trades.reduce((s, t) => s + t.pnl, 0);
   const namesOf = (list) => [...new Set(list.map(t => t.name || t.code))].join('・');
 
-  const outside = entries.filter(t => !checks.approved_codes.includes(t.code));
-  add('approved', '承認銘柄だけ', outside.length ? 'ng' : 'ok', outside.length ? namesOf(outside) : '');
+  // 試用銘柄は条件つきで認める（100株・10時前・1回の損失上限）
+  const trial = checks.trial;
+  const trialCodes = trial ? trial.codes : [];
+  const outside = entries.filter(t => !checks.approved_codes.includes(t.code) && !trialCodes.includes(t.code));
+  add('approved', trialCodes.length ? '承認・試用銘柄だけ' : '承認銘柄だけ', outside.length ? 'ng' : 'ok', outside.length ? namesOf(outside) : '');
+
+  const trialTrades = trades.filter(t => trialCodes.includes(t.code)).map(t => ({
+    ...t,
+    ok: t.qty <= trial.max_qty && t.pnl >= -trial.stop_yen && !(t.openTime && t.openTime >= checks.end_time),
+  }));
+  if (trialTrades.length) {
+    const bad = trialTrades.filter(t => !t.ok);
+    const why = bad.length ? [
+      bad.some(t => t.qty > trial.max_qty) && `最大${Math.max(...bad.map(t => t.qty))}株`,
+      bad.some(t => t.pnl < -trial.stop_yen) && `最大${fmtPnL(Math.min(...bad.map(t => t.pnl)))}円`,
+      bad.some(t => t.openTime && t.openTime >= checks.end_time) && `${checks.end_time}以降`,
+    ].filter(Boolean).join('・') : '';
+    add('trial', `試用は${trial.max_qty}株・-${trial.stop_yen.toLocaleString()}円以内`, bad.length ? 'ng' : 'ok', why);
+  }
 
   if (checks.require_day_trade) {
     if (!csv) add('day_trade', '日計り', 'na', 'CSVなし');
@@ -197,7 +214,7 @@ function evaluateDay(checks, csv, realTrades) {
 
   const judged = results.filter(r => r.status !== 'na');
   return {
-    results, total,
+    results, total, trialTrades,
     tradeCount: trades.length,
     ok: judged.length > 0 && judged.every(r => r.status === 'ok'),
     okCount: judged.filter(r => r.status === 'ok').length,
@@ -237,6 +254,7 @@ function App() {
         return {
           ...entry,
           headline: signal?.trading_rules?.headline,
+          trial: checks?.trial,
           hasTrades,
           eval: hasTrades && checks ? evaluateDay(checks, csv && csv.closes.length ? csv : null, realTrades) : null,
         };
@@ -249,7 +267,21 @@ function App() {
   const stats = useMemo(() => {
     if (!days) return null;
     const traded = days.filter(d => d.eval);
-    if (!traded.length) return { traded };
+
+    // 試用銘柄：開始日以降の取引を集計（ルールは最新の判定の記録から）
+    const trialRule = days.find(d => d.trial)?.trial || null;
+    let trial = null;
+    if (trialRule) {
+      const list = traded.filter(d => d.date >= trialRule.since).flatMap(d => d.eval.trialTrades.map(t => ({ ...t, date: d.date })));
+      const okList = list.filter(t => t.ok);
+      trial = {
+        rule: trialRule, list, okList,
+        wins: okList.filter(t => t.pnl > 0).length,
+        total: okList.reduce((s, t) => s + t.pnl, 0),
+        worst: okList.length ? Math.min(...okList.map(t => t.pnl)) : null,
+      };
+    }
+    if (!traded.length) return { traded, trial };
     const kept = traded.filter(d => d.eval.ok);
     const broken = traded.filter(d => !d.eval.ok);
 
@@ -272,7 +304,7 @@ function App() {
       return { date: d.date, daily: d.eval.total, cumulative: cum, ok: d.eval.ok };
     });
 
-    return { traded, kept, broken, rules, byVerdict, cumulative };
+    return { traded, kept, broken, rules, byVerdict, cumulative, trial };
   }, [days]);
 
   if (error) {
@@ -286,7 +318,7 @@ function App() {
 
   return (
     <Page>
-      {!stats.kept ? (
+      {!stats.traded.length ? (
         <div style={{ textAlign: 'center', padding: '40px 16px', color: '#475569', fontSize: 13 }}>
           判定とトレード記録がそろった日がまだありません
         </div>
@@ -331,6 +363,8 @@ function App() {
         </>
       )}
 
+      {stats.trial && <TrialCard trial={stats.trial} />}
+
       <Card title="📅 日別" delay="0.4s" action={
         <label style={{ fontSize: 10.5, color: '#64748b', display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
           <input type="checkbox" checked={showEmpty} onChange={e => setShowEmpty(e.target.checked)} />
@@ -346,6 +380,44 @@ function App() {
         ・「ロットは普段の半分」は普段の株数がわからないので判定に含めていません。
       </div>
     </Page>
+  );
+}
+
+// 試用銘柄の進み具合：条件どおりの取引が review_after 回たまったら、承認するか決め直す
+function TrialCard({ trial }) {
+  const { rule, list, okList, wins, total, worst } = trial;
+  const n = okList.length;
+  const progress = Math.min(1, n / rule.review_after);
+  const broken = list.length - n;
+  return (
+    <Card title={`🧪 試用銘柄（${(rule.names || rule.codes).join('・')}）　${rule.since.slice(5).replace('-', '/')}から`} delay="0.38s">
+      <div style={{ fontSize: 11.5, color: '#94a3b8', marginBottom: 10 }}>
+        条件：{rule.max_qty}株だけ・10時前だけ・-{rule.stop_yen.toLocaleString()}円で即損切り。条件どおりの取引が{rule.review_after}回たまったら承認を決め直す
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 6 }}>
+        <span style={{ fontWeight: 700 }}>{n} / {rule.review_after}回</span>
+        <span style={{ color: '#64748b' }}>{n >= rule.review_after ? '再判定のタイミング' : `あと${rule.review_after - n}回`}</span>
+      </div>
+      <div style={{ height: 6, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden', marginBottom: 12 }}>
+        <div style={{ width: `${progress * 100}%`, height: '100%', background: '#fbbf24' }} />
+      </div>
+      {n === 0 ? (
+        <div style={{ fontSize: 12, color: '#475569' }}>まだ条件どおりの取引がありません</div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))', gap: 8 }}>
+          <KPI label="勝率" value={`${Math.round(wins / n * 100)}%`} sub={`${wins}勝${n - wins}敗`} />
+          <KPI label="合計" value={fmtPnL(total)} sub="円" tone={total >= 0 ? 'good' : 'bad'} />
+          <KPI label="1回平均" value={fmtPnL(total / n)} sub="円" tone={total >= 0 ? 'good' : 'bad'} />
+          <KPI label="最大の負け" value={worst < 0 ? fmtPnL(worst) : 'なし'} sub={worst < 0 ? '円' : '負けなし'} tone={worst < 0 ? 'bad' : 'good'} />
+        </div>
+      )}
+      {broken > 0 && (
+        <div style={{ fontSize: 11, color: '#fb7185', marginTop: 10 }}>
+          条件を破った試用の取引 {broken}回（集計に含めていません）：
+          {list.filter(t => !t.ok).sort((a, b) => a.date.localeCompare(b.date)).map(t => `${t.date.slice(5)} ${t.qty}株 ${fmtPnL(t.pnl)}円`).join('、')}
+        </div>
+      )}
+    </Card>
   );
 }
 
