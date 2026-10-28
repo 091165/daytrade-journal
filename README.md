@@ -70,6 +70,20 @@ daytrade-journal/
 
 ---
 
+## ✅ ルール遵守の振り返り（review.html）
+
+毎朝の判定（[daytrade](https://github.com/okanemochi-banzai/daytrade) の Signal Board）と、実際のトレードを突き合わせるページ。
+
+- 判定は Signal Board が日付ごとに残す `archive/YYYY-MM-DD.json`（寄り前の版）を読む
+  - 既定は同じ GitHub Pages 上の `../daytrade/`。`review.html?signal=https://.../` で差し替え可
+- トレードは `data/YYYY-MM-DD.csv`（SBIの信用決済明細・約定履歴）と、振り返りメモ `data/YYYY-MM-DD.json` の `realTrades` を使う
+- その日のルールごとに ✓ / ✗ を出し、守れた日と破った日の平均損益、ルール別に破った日数、判定別の成績を表示
+- 判定できるルール：承認銘柄だけ・日計り・1日の損失上限・終了時刻・方向の統一（トレンド日）・1回の損切り幅（トレンド日）・株数／様子見の時間帯／連敗で終了（方向なしの日）
+- 時刻が必要なルール（終了時刻・様子見・連敗）は、`realTrades` に時刻がある日だけ判定する
+- 「ロットは普段の半分」は普段の株数がわからないので判定しない
+
+運用：朝は Signal Board を見て取引 → 引け後にCSV（と振り返りメモ）をアップ → このページに成果が出る。
+
 ## 🔧 表示の切り替え
 
 ブラウザのURLパラメータで読み込みCSVを指定できます：

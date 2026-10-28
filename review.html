@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rule Review</title>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.9/babel.min.js"></script>
+<style>
+  body { margin: 0; background: #080d18; font-family: 'Hiragino Sans','Noto Sans JP',sans-serif; }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .fade-up { animation: fadeUp 0.5s ease-out backwards; }
+</style>
+</head>
+<body>
+<div id="root"><div style="color:#64748b;text-align:center;padding:80px 16px;font-family:'Hiragino Sans',sans-serif;">読み込み中...</div></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+// 毎朝の判定（daytrade リポジトリの GitHub Pages）。?signal=URL で差し替え可
+const SIGNAL_BASE = new URLSearchParams(window.location.search).get('signal') || '../daytrade/';
+
+const VERDICTS = {
+  buy_bias: { label: '買いポジ主体', color: '#4ade80' },
+  sell_bias: { label: '売りポジ主体', color: '#fb7185' },
+  hands_off: { label: '手出し無用', color: '#fbbf24' },
+};
+
+// ═══ CSV（信用決済明細 / 約定履歴照会の両方） ═══
+function parseCsvLine(line) {
+  const cols = [];
+  let cur = '', inQuote = false;
+  for (let j = 0; j < line.length; j++) {
+    const ch = line[j];
+    if (ch === '"') { inQuote = !inQuote; }
+    else if (ch === ',' && !inQuote) { cols.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  cols.push(cur);
+  return cols.map(c => c.trim());
+}
+
+const num = (s) => parseFloat(String(s).replace(/,/g, '').replace(/\+/g, ''));
+
+// 返り値: { entries: [{code,name,direction,qty,term}], closes: [{code,name,direction,qty,pnl}] }
+function parseTradeCSV(text) {
+  const lines = text.split(/\r?\n/);
+  const settleIdx = lines.findIndex(l => l.startsWith('決済日'));
+  const ordersIdx = lines.findIndex(l => l.startsWith('約定日'));
+  const entries = [], closes = [];
+  const headerIdx = settleIdx >= 0 ? settleIdx : ordersIdx;
+  if (headerIdx < 0) return { entries, closes };
+
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line || line.startsWith('（')) continue;
+    const cols = parseCsvLine(line);
+    if (settleIdx >= 0) {
+      // 決済日,銘柄,銘柄コード,決済市場,取引,期限,預り,課税,建市場,建日,買/売建,決済数量,建単価,決済単価,...,受渡金額/決済損益
+      if (cols.length < 28) continue;
+      const row = {
+        code: cols[2], name: cols[1], term: cols[5],
+        direction: cols[10].includes('売建') ? 'sell' : 'buy',
+        qty: parseInt(cols[11].replace(/,/g, '')),
+      };
+      const pnl = num(cols[27]);
+      if (isNaN(row.qty) || isNaN(pnl)) continue;
+      entries.push(row);
+      closes.push({ ...row, pnl });
+    } else {
+      // 約定日,銘柄,銘柄コード,市場,取引,期限,預り,課税,約定数量,約定単価,手数料,税額,受渡日,受渡金額/決済損益
+      if (cols.length < 14) continue;
+      const kind = cols[4];
+      const qty = parseInt(cols[8].replace(/,/g, ''));
+      if (isNaN(qty)) continue;
+      if (kind.includes('新規')) {
+        entries.push({ code: cols[2], name: cols[1], term: cols[5], qty,
+          direction: kind.includes('売') ? 'sell' : 'buy' });
+      } else if (kind.includes('返済')) {
+        const pnl = num(cols[13]);
+        if (!isNaN(pnl)) closes.push({ code: cols[2], name: cols[1], qty, pnl,
+          direction: kind.includes('返済売') ? 'buy' : 'sell' });
+      }
+    }
+  }
+  return { entries, closes };
+}
+
+async function fetchText(url) {
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  const buf = await r.arrayBuffer();
+  let text = new TextDecoder('utf-8').decode(buf);
+  if (!text.includes('銘柄')) text = new TextDecoder('shift_jis').decode(buf);
+  return text;
+}
+
+async function fetchJSON(url) {
+  try {
+    const r = await fetch(url);
+    return r.ok ? await r.json() : null;
+  } catch { return null; }
+}
+
+// 振り返りメモの実質トレード（時刻つき）。data/{date}.json → data/notes/{date}.json
+async function fetchRealTrades(date) {
+  const notes = (await fetchJSON(`data/${date}.json`)) || (await fetchJSON(`data/notes/${date}.json`));
+  if (!notes?.realTrades) return null;
+  const list = [];
+  Object.entries(notes.realTrades).forEach(([code, ts]) => {
+    ts.forEach(t => list.push({ code, direction: t.direction, qty: t.qty, pnl: t.pnl,
+      openTime: t.openTime || null, closeTime: t.closeTime || null }));
+  });
+  return list.length ? list : null;
+}
+
+// ═══ ルール判定（signal の trading_rules.checks を使う） ═══
+// status: ok / ng / na（記録が足りず判定できない）
+function evaluateDay(checks, csv, realTrades) {
+  const results = [];
+  const add = (key, label, status, detail = '') => results.push({ key, label, status, detail });
+  const entries = csv ? csv.entries : (realTrades || []);
+  // 1回ごとの損益・株数は実質トレード（建て〜決済のまとまり）を優先。なければCSVの明細
+  const trades = realTrades || (csv ? csv.closes : []);
+  const timed = realTrades ? realTrades.filter(t => t.openTime) : [];
+  const allTimed = realTrades && timed.length === realTrades.length;
+  const total = csv ? csv.closes.reduce((s, t) => s + t.pnl, 0) : trades.reduce((s, t) => s + t.pnl, 0);
+  const namesOf = (list) => [...new Set(list.map(t => t.name || t.code))].join('・');
+
+  const outside = entries.filter(t => !checks.approved_codes.includes(t.code));
+  add('approved', '承認銘柄だけ', outside.length ? 'ng' : 'ok', outside.length ? namesOf(outside) : '');
+
+  if (checks.require_day_trade) {
+    if (!csv) add('day_trade', '日計り', 'na', 'CSVなし');
+    else {
+      const bad = csv.entries.filter(t => !t.term.startsWith('日計り'));
+      add('day_trade', '日計り', bad.length ? 'ng' : 'ok', bad.length ? `${bad.length}件が${bad[0].term}` : '');
+    }
+  }
+
+  add('loss_limit', `-${checks.daily_loss_limit_yen.toLocaleString()}円で終了`,
+    total > -checks.daily_loss_limit_yen ? 'ok' : 'ng', total > -checks.daily_loss_limit_yen ? '' : `${fmtPnL(total)}円`);
+
+  if (!timed.length) add('end_time', `${checks.end_time}前に終了`, 'na', '時刻なし');
+  else {
+    const late = timed.filter(t => t.openTime >= checks.end_time);
+    add('end_time', `${checks.end_time}前に終了`, late.length ? 'ng' : 'ok',
+      late.length ? `${late[0].openTime}に新規` : (allTimed ? '' : '一部時刻なし'));
+  }
+
+  if (checks.direction) {
+    const want = checks.direction === 'buy' ? '買い' : '売り';
+    const against = entries.filter(t => t.direction !== checks.direction);
+    add('direction', `全部${want}`, against.length ? 'ng' : 'ok', against.length ? `逆向き${against.length}件` : '');
+  }
+
+  if (checks.per_trade_stop_yen) {
+    const big = trades.filter(t => t.pnl < -checks.per_trade_stop_yen);
+    add('stop', `1回 -${checks.per_trade_stop_yen.toLocaleString()}円以内`, big.length ? 'ng' : 'ok',
+      big.length ? `最大${fmtPnL(Math.min(...big.map(t => t.pnl)))}円` : '');
+  }
+
+  if (checks.max_qty) {
+    const over = trades.filter(t => t.qty > checks.max_qty);
+    add('max_qty', `${checks.max_qty}株だけ`, over.length ? 'ng' : 'ok',
+      over.length ? `最大${Math.max(...over.map(t => t.qty))}株` : '');
+  }
+
+  if (checks.wait_window) {
+    const [from, to] = checks.wait_window;
+    if (!timed.length) add('wait', `${from}〜${to}は様子見`, 'na', '時刻なし');
+    else {
+      const inWin = timed.filter(t => t.openTime >= from && t.openTime < to);
+      add('wait', `${from}〜${to}は様子見`, inWin.length ? 'ng' : 'ok', inWin.length ? `${inWin[0].openTime}に新規` : '');
+    }
+  }
+
+  if (checks.max_consecutive_losses) {
+    const n = checks.max_consecutive_losses;
+    if (!allTimed || !timed.every(t => t.closeTime)) add('streak', `${n}連敗で終了`, 'na', '時刻なし');
+    else {
+      const sorted = [...timed].sort((a, b) => a.closeTime.localeCompare(b.closeTime));
+      let streak = 0, stopAt = null;
+      for (const t of sorted) {
+        streak = t.pnl < 0 ? streak + 1 : 0;
+        if (streak >= n) { stopAt = t.closeTime; break; }
+      }
+      const after = stopAt ? timed.filter(t => t.openTime > stopAt) : [];
+      add('streak', `${n}連敗で終了`, after.length ? 'ng' : 'ok', after.length ? `${stopAt}以降も${after.length}件` : '');
+    }
+  }
+
+  const judged = results.filter(r => r.status !== 'na');
+  return {
+    results, total,
+    tradeCount: trades.length,
+    ok: judged.length > 0 && judged.every(r => r.status === 'ok'),
+    okCount: judged.filter(r => r.status === 'ok').length,
+    judgedCount: judged.length,
+  };
+}
+
+function fmtPnL(n) {
+  if (n == null) return '--';
+  return (n >= 0 ? '+' : '') + Math.round(n).toLocaleString();
+}
+
+const avg = (list) => list.length ? list.reduce((s, d) => s + d.eval.total, 0) / list.length : null;
+const sum = (list) => list.reduce((s, d) => s + d.eval.total, 0);
+
+function App() {
+  const [days, setDays] = useState(null);
+  const [error, setError] = useState(null);
+  const [showEmpty, setShowEmpty] = useState(false);
+
+  useEffect(() => {
+    async function load() {
+      const index = await fetchJSON(`${SIGNAL_BASE}archive/index.json`);
+      if (!index) {
+        setError(`判定の記録（${SIGNAL_BASE}archive/index.json）を読み込めませんでした`);
+        return;
+      }
+      const loaded = await Promise.all(index.map(async (entry) => {
+        const [signal, csvText, realTrades] = await Promise.all([
+          fetchJSON(`${SIGNAL_BASE}archive/${entry.date}.json`),
+          fetchText(`data/${entry.date}.csv`).catch(() => null),
+          fetchRealTrades(entry.date),
+        ]);
+        const csv = csvText ? parseTradeCSV(csvText) : null;
+        const hasTrades = (csv && csv.closes.length > 0) || !!realTrades;
+        const checks = signal?.trading_rules?.checks;
+        return {
+          ...entry,
+          headline: signal?.trading_rules?.headline,
+          hasTrades,
+          eval: hasTrades && checks ? evaluateDay(checks, csv && csv.closes.length ? csv : null, realTrades) : null,
+        };
+      }));
+      setDays(loaded.sort((a, b) => b.date.localeCompare(a.date)));
+    }
+    load().catch(e => setError(String(e)));
+  }, []);
+
+  const stats = useMemo(() => {
+    if (!days) return null;
+    const traded = days.filter(d => d.eval);
+    if (!traded.length) return { traded };
+    const kept = traded.filter(d => d.eval.ok);
+    const broken = traded.filter(d => !d.eval.ok);
+
+    const ruleMap = {};
+    traded.forEach(d => d.eval.results.forEach(r => {
+      const m = ruleMap[r.key] || (ruleMap[r.key] = { label: r.label, judged: 0, ng: [] });
+      if (r.status !== 'na') m.judged += 1;
+      if (r.status === 'ng') m.ng.push(d);
+    }));
+    const rules = Object.values(ruleMap).filter(r => r.judged > 0).sort((a, b) => b.ng.length - a.ng.length);
+
+    const byVerdict = Object.keys(VERDICTS).map(v => {
+      const list = traded.filter(d => d.verdict === v);
+      return { verdict: v, list, kept: list.filter(d => d.eval.ok).length, wins: list.filter(d => d.eval.total > 0).length };
+    }).filter(v => v.list.length);
+
+    let cum = 0;
+    const cumulative = [...traded].reverse().map(d => {
+      cum += d.eval.total;
+      return { date: d.date, daily: d.eval.total, cumulative: cum, ok: d.eval.ok };
+    });
+
+    return { traded, kept, broken, rules, byVerdict, cumulative };
+  }, [days]);
+
+  if (error) {
+    return <Page><div style={{ textAlign: 'center', padding: '40px 16px', color: '#fb7185', fontSize: 13 }}>{error}</div></Page>;
+  }
+  if (!days) {
+    return <div style={{ color: '#64748b', textAlign: 'center', padding: '80px 16px' }}>読み込み中...</div>;
+  }
+
+  const listed = showEmpty ? days : days.filter(d => d.eval);
+
+  return (
+    <Page>
+      {!stats.kept ? (
+        <div style={{ textAlign: 'center', padding: '40px 16px', color: '#475569', fontSize: 13 }}>
+          判定とトレード記録がそろった日がまだありません
+        </div>
+      ) : (
+        <>
+          <div className="fade-up" style={{ animationDelay: '0.08s', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, marginBottom: 22 }}>
+            <KPI label="ルールを守れた日" value={`${Math.round(stats.kept.length / stats.traded.length * 100)}%`}
+              sub={`${stats.kept.length} / ${stats.traded.length}日`} tone={stats.kept.length * 2 >= stats.traded.length ? 'good' : 'bad'} />
+            <KPI label="累計損益" value={fmtPnL(sum(stats.traded))} sub="円（対象日のみ）" tone={sum(stats.traded) >= 0 ? 'good' : 'bad'} />
+            <KPI label="守れた日の平均" value={stats.kept.length ? fmtPnL(avg(stats.kept)) : '--'} sub={`円／日（${stats.kept.length}日）`}
+              tone={avg(stats.kept) >= 0 ? 'good' : 'bad'} />
+            <KPI label="破った日の平均" value={stats.broken.length ? fmtPnL(avg(stats.broken)) : '--'} sub={`円／日（${stats.broken.length}日）`}
+              tone={avg(stats.broken) >= 0 ? 'good' : 'bad'} />
+          </div>
+
+          <CumulativeChart cumulative={stats.cumulative} />
+
+          <Card title="🚦 ルール別：破った日数" delay="0.28s">
+            {stats.rules.map((r, i) => (
+              <Row key={r.label} first={i === 0}
+                left={<><span style={{ fontSize: 13, fontWeight: 600 }}>{r.label}</span>
+                  <span style={{ fontSize: 10, color: '#475569', marginLeft: 8 }}>判定 {r.judged}日</span></>}
+                right={r.ng.length === 0
+                  ? <span style={{ fontSize: 12, color: '#4ade80', fontWeight: 700 }}>全日 ✓</span>
+                  : <span style={{ fontSize: 12, fontFamily: 'ui-monospace, monospace', textAlign: 'right' }}>
+                      <span style={{ color: '#fb7185', fontWeight: 700 }}>✗ {r.ng.length}日</span>
+                      <span style={{ color: '#64748b', marginLeft: 8 }}>その日の損益 {fmtPnL(sum(r.ng))}円</span>
+                    </span>} />
+            ))}
+          </Card>
+
+          <Card title="🧭 判定別の成績" delay="0.34s">
+            {stats.byVerdict.map((v, i) => (
+              <Row key={v.verdict} first={i === 0}
+                left={<><span style={{ fontSize: 13, fontWeight: 600, color: VERDICTS[v.verdict].color }}>{VERDICTS[v.verdict].label}</span>
+                  <span style={{ fontSize: 10, color: '#475569', marginLeft: 8 }}>
+                    {v.list.length}日 ／ 勝ち{v.wins}日 ／ 遵守{v.kept}日</span></>}
+                right={<span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'ui-monospace, monospace', color: sum(v.list) >= 0 ? '#4ade80' : '#fb7185' }}>
+                  平均 {fmtPnL(avg(v.list))}円</span>} />
+            ))}
+          </Card>
+        </>
+      )}
+
+      <Card title="📅 日別" delay="0.4s" action={
+        <label style={{ fontSize: 10.5, color: '#64748b', display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+          <input type="checkbox" checked={showEmpty} onChange={e => setShowEmpty(e.target.checked)} />
+          記録のない日も表示
+        </label>}>
+        {listed.length === 0 && <div style={{ fontSize: 12, color: '#475569', padding: '8px 0' }}>表示する日がありません</div>}
+        {listed.map((d, i) => <DayRow key={d.date} day={d} first={i === 0} />)}
+      </Card>
+
+      <div style={{ fontSize: 10, color: '#475569', lineHeight: 1.7, marginTop: 8 }}>
+        ・判定は毎朝の Signal Board の記録（寄り前の版）を使います。<b>推定</b>は記録がなく、判定ラベルから今のルールで組み立て直した日、<b>寄り後</b>は判定が寄り付き後に作られた日です。<br />
+        ・時刻が必要なルール（終了時刻・様子見・連敗）は、振り返りメモ（data/日付.json）の実質トレードに時刻がある日だけ判定します。<br />
+        ・「ロットは普段の半分」は普段の株数がわからないので判定に含めていません。
+      </div>
+    </Page>
+  );
+}
+
+function Page({ children }) {
+  return (
+    <div style={{
+      background: 'radial-gradient(ellipse at top, #0f1729 0%, #080d18 60%)',
+      minHeight: '100vh', padding: '20px 16px 60px', color: '#e2e8f0',
+    }}>
+      <div style={{ maxWidth: 760, margin: '0 auto' }}>
+        <div style={{ display: 'flex', gap: 14, marginBottom: 10, fontSize: 11 }}>
+          <a href="./" style={{ color: '#475569', textDecoration: 'none' }}>← トップ</a>
+          <a href="month.html" style={{ color: '#475569', textDecoration: 'none' }}>月次</a>
+          <a href={SIGNAL_BASE} style={{ color: '#475569', textDecoration: 'none' }}>今日の判定 →</a>
+        </div>
+        <div className="fade-up" style={{ paddingBottom: 14, marginBottom: 20, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+          <div style={{ fontSize: 9.5, color: '#475569', letterSpacing: 4, marginBottom: 4 }}>RULE REVIEW</div>
+          <div style={{ fontSize: 20, fontWeight: 700, letterSpacing: -0.3 }}>毎朝の判定どおりにできたか</div>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Card({ title, delay, action, children }) {
+  return (
+    <div className="fade-up" style={{ animationDelay: delay, marginBottom: 22 }}>
+      <div style={{
+        background: 'linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0.005))',
+        border: '1px solid rgba(255,255,255,0.06)', borderRadius: 14, padding: 14,
+      }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <div style={{ fontSize: 10, color: '#475569', letterSpacing: 2, fontWeight: 700 }}>{title}</div>
+          {action}
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Row({ left, right, first }) {
+  return (
+    <div style={{
+      display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+      padding: '8px 0', borderTop: first ? 'none' : '1px solid rgba(255,255,255,0.04)',
+    }}>
+      <div>{left}</div>
+      {right}
+    </div>
+  );
+}
+
+function Badge({ children, color = '#94a3b8' }) {
+  return <span style={{
+    fontSize: 9.5, color, border: `1px solid ${color}55`, borderRadius: 6, padding: '1px 6px', marginLeft: 6,
+  }}>{children}</span>;
+}
+
+const STATUS = {
+  ok: { mark: '✓', color: '#4ade80', bg: 'rgba(74,222,128,0.08)' },
+  ng: { mark: '✗', color: '#fb7185', bg: 'rgba(251,113,133,0.1)' },
+  na: { mark: '–', color: '#64748b', bg: 'rgba(255,255,255,0.03)' },
+};
+
+function DayRow({ day, first }) {
+  const v = VERDICTS[day.verdict] || { label: day.verdict_label || '?', color: '#94a3b8' };
+  const e = day.eval;
+  return (
+    <div style={{ padding: '10px 0', borderTop: first ? 'none' : '1px solid rgba(255,255,255,0.04)', opacity: e ? 1 : 0.45 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
+        <a href={day.hasTrades ? `day.html?date=${day.date}` : null} style={{ color: 'inherit', textDecoration: 'none' }}>
+          <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'ui-monospace, monospace' }}>{day.date.slice(5)}</span>
+          <span style={{ fontSize: 11.5, color: v.color, marginLeft: 8, fontWeight: 600 }}>{v.label}</span>
+          {day.reconstructed && <Badge>推定</Badge>}
+          {day.generated_after_open && <Badge color="#fbbf24">寄り後</Badge>}
+        </a>
+        {e ? (
+          <span style={{ whiteSpace: 'nowrap' }}>
+            <span style={{ fontSize: 11, color: e.ok ? '#4ade80' : '#fb7185', marginRight: 10, fontWeight: 700 }}>
+              {e.ok ? '遵守' : '違反'} {e.okCount}/{e.judgedCount}
+            </span>
+            <span style={{ fontSize: 14, fontWeight: 700, fontFamily: 'ui-monospace, monospace', color: e.total >= 0 ? '#4ade80' : '#fb7185' }}>
+              {fmtPnL(e.total)}
+            </span>
+          </span>
+        ) : <span style={{ fontSize: 11, color: '#475569' }}>{day.hasTrades ? 'ルール情報なし' : '記録なし'}</span>}
+      </div>
+      {e && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 7 }}>
+          {e.results.map(r => {
+            const s = STATUS[r.status];
+            return (
+              <span key={r.key} title={r.detail} style={{
+                fontSize: 10.5, color: s.color, background: s.bg, borderRadius: 6, padding: '2px 7px',
+              }}>{s.mark} {r.label}{r.status === 'ng' && r.detail ? `（${r.detail}）` : ''}</span>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function KPI({ label, value, sub, tone }) {
+  const color = tone === 'good' ? '#4ade80' : tone === 'bad' ? '#fb7185' : '#e2e8f0';
+  return (
+    <div style={{
+      background: 'linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.01))',
+      border: '1px solid rgba(255,255,255,0.06)',
+      borderRadius: 14, padding: '12px 14px',
+    }}>
+      <div style={{ fontSize: 10, color: '#64748b', marginBottom: 4, letterSpacing: 0.5 }}>{label}</div>
+      <div style={{ fontSize: 19, fontWeight: 700, color, fontFamily: 'ui-monospace, monospace', lineHeight: 1.1 }}>{value}</div>
+      <div style={{ fontSize: 9.5, color: '#475569', marginTop: 3 }}>{sub}</div>
+    </div>
+  );
+}
+
+// 累計損益。点の色はその日にルールを守れたか（緑=遵守 / 赤=違反）
+function CumulativeChart({ cumulative }) {
+  if (!cumulative || cumulative.length < 2) return null;
+
+  const width = 720, height = 200;
+  const margin = { left: 50, right: 12, top: 14, bottom: 24 };
+  const chartW = width - margin.left - margin.right;
+  const chartH = height - margin.top - margin.bottom;
+
+  const cumValues = cumulative.map(c => c.cumulative);
+  const yMin = Math.min(0, Math.min(...cumValues));
+  const yMax = Math.max(0, Math.max(...cumValues));
+  const yPad = (yMax - yMin) * 0.1 || 1000;
+  const yLo = yMin - yPad;
+  const yHi = yMax + yPad;
+  const yRange = yHi - yLo;
+
+  const xFor = (i) => margin.left + (i / (cumulative.length - 1)) * chartW;
+  const yFor = (v) => margin.top + ((yHi - v) / yRange) * chartH;
+  const yZero = yFor(0);
+  const linePath = 'M ' + cumulative.map((c, i) => `${xFor(i).toFixed(1)},${yFor(c.cumulative).toFixed(1)}`).join(' L ');
+
+  return (
+    <Card title="📈 累計損益（点の色：緑＝ルールを守れた日 / 赤＝破った日）" delay="0.2s">
+      <svg viewBox={`0 0 ${width} ${height}`} style={{ width: '100%', height: 'auto', display: 'block' }}>
+        {[0, 0.25, 0.5, 0.75, 1].map(i => {
+          const y = margin.top + i * chartH;
+          const v = yHi - i * yRange;
+          return (
+            <g key={i}>
+              <line x1={margin.left} y1={y} x2={margin.left + chartW} y2={y}
+                stroke="rgba(255,255,255,0.04)" strokeWidth="0.5" strokeDasharray="2,4" />
+              <text x={margin.left - 6} y={y} fill="#64748b" fontSize="9.5" textAnchor="end" dominantBaseline="middle"
+                fontFamily="ui-monospace, monospace">{Math.round(v).toLocaleString()}</text>
+            </g>
+          );
+        })}
+        <line x1={margin.left} y1={yZero} x2={margin.left + chartW} y2={yZero}
+          stroke="rgba(255,255,255,0.15)" strokeWidth="1" strokeDasharray="3,3" />
+        <path d={linePath} fill="none" stroke="#94a3b8" strokeWidth="1.5" />
+        {[0, Math.floor(cumulative.length / 2), cumulative.length - 1].map(i => (
+          <text key={i} x={xFor(i)} y={margin.top + chartH + 14}
+            fill="#64748b" fontSize="9.5" textAnchor="middle" fontFamily="ui-monospace, monospace">
+            {cumulative[i].date.slice(5)}
+          </text>
+        ))}
+        {cumulative.map((c, i) => (
+          <circle key={i} cx={xFor(i)} cy={yFor(c.cumulative)} r="4"
+            fill={c.ok ? '#4ade80' : '#fb7185'} stroke="#080d18" strokeWidth="1.5">
+            <title>{`${c.date} ${fmtPnL(c.daily)}円`}</title>
+          </circle>
+        ))}
+      </svg>
+    </Card>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
