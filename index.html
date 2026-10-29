@@ -401,6 +401,7 @@ async function probeRecentDates(daysBack = 90) {
 // Process a single day's CSV → summary
 // ═══════════════════════════════════════════════════════════════════
 async function processDayCsv(file) {
+  if (!file.url && file.notes) return processDayNotes(file);
   try {
     const res = await fetch(file.url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -415,6 +416,30 @@ async function processDayCsv(file) {
       tradeCount: trades.length,
       closingCount: closing.length,
       wins,
+      symbols: [...new Set(trades.map(t => t.name))],
+    };
+  } catch (e) {
+    return { date: file.date, error: e.message, totalPnL: 0, tradeCount: 0, closingCount: 0, wins: 0, symbols: [] };
+  }
+}
+
+// CSV がない日：振り返りメモの実質トレードから集計する
+async function processDayNotes(file) {
+  try {
+    const res = await fetch(file.notes);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const notes = await res.json();
+    const trades = Object.entries(notes.realTrades || {}).flatMap(([code, list]) => {
+      const m = (notes.stocks?.[code] || '').match(/^##\s*([^（(\s]+)/);
+      return list.map(t => ({ name: m ? m[1] : code, pnl: t.pnl }));
+    });
+    if (!trades.length) throw new Error('取引なし');
+    return {
+      date: file.date,
+      totalPnL: trades.reduce((s, t) => s + t.pnl, 0),
+      tradeCount: trades.length,
+      closingCount: trades.length,
+      wins: trades.filter(t => t.pnl > 0).length,
       symbols: [...new Set(trades.map(t => t.name))],
     };
   } catch (e) {
@@ -685,6 +710,17 @@ async function boot() {
     currentMonth = new Date();
     renderApp();
     return;
+  }
+
+  // CSV がなく振り返りメモだけある日も加える（data/index.json の一覧から）
+  try {
+    const idx = await fetchWithTimeout('data/index.json', {}, 8000).then(r => r.ok ? r.json() : []);
+    const have = new Set(files.map(f => f.date));
+    idx.filter(d => !d.csv && d.notes && !have.has(d.date))
+       .forEach(d => files.push({ date: d.date, name: d.notes, url: null, notes: d.notes }));
+    files.sort((a, b) => a.date.localeCompare(b.date));
+  } catch (err) {
+    console.warn('[journal] data/index.json の読み込みに失敗:', err.message);
   }
 
   // Process all CSVs in parallel
