@@ -80,6 +80,29 @@ async function listTradeCsvs() {
     }));
 }
 
+// CSV がなく振り返りメモ（data/YYYY-MM-DD.json）だけある日：realTrades の銘柄コードを使う
+async function listNotesOnlyDays(csvDates) {
+  let entries;
+  try {
+    entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const e of entries) {
+    const m = e.isFile() && e.name.match(/^(\d{4}-\d{2}-\d{2})\.json$/);
+    if (!m || csvDates.has(m[1])) continue;
+    try {
+      const notes = JSON.parse(await fs.readFile(path.join(DATA_DIR, e.name), 'utf8'));
+      const codes = Object.keys(notes.realTrades || {}).filter(c => /^[0-9A-Z]{4,5}$/.test(c));
+      if (codes.length) out.push({ date: m[1], codes });
+    } catch (err) {
+      console.warn(`Skip ${e.name}: ${err.message}`);
+    }
+  }
+  return out;
+}
+
 // ── Yahoo Finance ────────────────────────────────────────────────
 function dateRangeForFetch(dateStr) {
   // dateStr is the target trading date in JST (YYYY-MM-DD)
@@ -139,9 +162,14 @@ async function fileExists(p) {
 async function main() {
   const csvs = await listTradeCsvs();
   console.log(`Found ${csvs.length} CSV file(s)`);
+  const days = [];
+  for (const csv of csvs) days.push({ date: csv.date, codes: await extractTickers(csv.path) });
+  const notesOnly = await listNotesOnlyDays(new Set(csvs.map(c => c.date)));
+  console.log(`Found ${notesOnly.length} day(s) with notes only (no CSV)`);
+  days.push(...notesOnly);
 
-  for (const csv of csvs) {
-    const codes = await extractTickers(csv.path);
+  for (const csv of days) {
+    const codes = csv.codes;
     console.log(`\n[${csv.date}] tickers: ${codes.join(', ') || '(none)'}`);
 
     const outDir = path.join(PRICES_DIR, csv.date);

@@ -63,6 +63,25 @@ function parseDecisionCSV(text) {
   return trades;
 }
 
+// CSV がない日：振り返りメモ（data/{date}.json）の実質トレードから取引を作る
+async function tradesFromNotes(date) {
+  try {
+    const r = await fetch(`data/${date}.json`);
+    if (!r.ok) return null;
+    const notes = await r.json();
+    const trades = [];
+    Object.entries(notes.realTrades || {}).forEach(([code, list]) => {
+      const m = (notes.stocks?.[code] || '').match(/^##\s*([^（(\s]+)/);
+      list.forEach((t, i) => trades.push({
+        tripId: i, code, name: m ? m[1] : code, qty: t.qty,
+        direction: t.direction === 'sell' ? 'short' : 'long',
+        openPrice: t.openPrice, closePrice: t.closePrice, pnl: t.pnl,
+      }));
+    });
+    return trades.length ? trades : null;
+  } catch { return null; }
+}
+
 function fmtPnL(n) {
   if (n == null) return '--';
   return (n >= 0 ? '+' : '') + Math.round(n).toLocaleString();
@@ -92,8 +111,8 @@ function App() {
         promises.push(
           fetch(`data/${date}.csv`)
             .then(r => r.ok ? r.arrayBuffer() : null)
-            .then(buf => {
-              if (!buf) return [date, null];
+            .then(async buf => {
+              if (!buf) return [date, await tradesFromNotes(date)];
               let text;
               try {
                 text = new TextDecoder('shift_jis').decode(buf);

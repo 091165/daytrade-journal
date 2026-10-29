@@ -94,6 +94,24 @@ function parseDecisionCSV(text) {
   return trades;
 }
 
+// CSV がない日：振り返りメモの実質トレード（realTrades）から、信用決済明細と同じ形の取引を作る
+function nameFromNotes(notes, code) {
+  const m = (notes?.stocks?.[code] || '').match(/^##\s*([^（(\s]+)/);
+  return m ? m[1] : code;
+}
+function tradesFromNotes(notes, date) {
+  const trades = [];
+  Object.entries(notes.realTrades || {}).forEach(([code, list]) => {
+    list.forEach((t, i) => trades.push({
+      tripId: i, code, name: nameFromNotes(notes, code), qty: t.qty,
+      direction: t.direction === 'sell' ? 'short' : 'long',
+      openPrice: t.openPrice, closePrice: t.closePrice, pnl: t.pnl, date,
+      openTime: t.openTime || null, closeTime: t.closeTime || null,
+    }));
+  });
+  return trades;
+}
+
 // 約定履歴 format - one execution per row
 function parseExecutionCSV(text) {
   // Simple fallback - returns empty (the user always uses 信用決済明細)
@@ -991,21 +1009,35 @@ function App() {
       setLoading(true);
       setError(null);
       try {
-        // Load CSV
-        const csvRes = await fetch(`data/${date}.csv`);
-        if (!csvRes.ok) throw new Error(`CSV not found: ${date}`);
-        const csvBlob = await csvRes.arrayBuffer();
-        // Try Shift_JIS first, fallback to UTF-8
-        let csvText;
+        // 振り返りメモ: まず data/{date}.json（同フォルダ・新方式）、無ければ data/notes/{date}.json（旧方式・後方互換）
+        let notes = null;
         try {
-          csvText = new TextDecoder('shift_jis').decode(csvBlob);
-          if (!csvText.includes('決済日') && !csvText.includes('信用')) {
+          let notesRes = await fetch(`data/${date}.json`);
+          if (!notesRes.ok) notesRes = await fetch(`data/notes/${date}.json`);
+          if (notesRes.ok) notes = await notesRes.json();
+        } catch {}
+
+        // Load CSV（ない日は振り返りメモの実質トレードから作る）
+        let parsedTrades;
+        const csvRes = await fetch(`data/${date}.csv`);
+        if (csvRes.ok) {
+          const csvBlob = await csvRes.arrayBuffer();
+          // Try Shift_JIS first, fallback to UTF-8
+          let csvText;
+          try {
+            csvText = new TextDecoder('shift_jis').decode(csvBlob);
+            if (!csvText.includes('決済日') && !csvText.includes('信用')) {
+              csvText = new TextDecoder('utf-8').decode(csvBlob);
+            }
+          } catch {
             csvText = new TextDecoder('utf-8').decode(csvBlob);
           }
-        } catch {
-          csvText = new TextDecoder('utf-8').decode(csvBlob);
+          parsedTrades = parseCSV(csvText);
+        } else if (notes?.realTrades) {
+          parsedTrades = tradesFromNotes(notes, date);
+        } else {
+          throw new Error(`CSV not found: ${date}`);
         }
-        const parsedTrades = parseCSV(csvText);
         setTrades(parsedTrades);
 
         // Load price data for each stock
@@ -1021,16 +1053,7 @@ function App() {
         priceResults.forEach(([code, data]) => { if (data) pmap[code] = data; });
         setPriceMap(pmap);
 
-        // Load notes: まず data/{date}.json（同フォルダ・新方式）、無ければ data/notes/{date}.json（旧方式・後方互換）
-        try {
-          let notesRes = await fetch(`data/${date}.json`);
-          if (!notesRes.ok) {
-            notesRes = await fetch(`data/notes/${date}.json`);
-          }
-          if (notesRes.ok) {
-            setNotesData(await notesRes.json());
-          }
-        } catch {}
+        if (notes) setNotesData(notes);
       } catch (err) {
         setError(err.message);
       } finally {
@@ -1081,7 +1104,7 @@ function App() {
   
   // Day of week
   const dateObj = new Date(date + 'T00:00:00+09:00');
-  const dowJa = ['日','月','火','水','木','金','土'][dateObj.getDay()];
+  const dowJa = ['日','月','火','水','木','金','土'][new Date(date + 'T00:00:00Z').getUTCDay()];  // 端末のタイムゾーンに関係なく日付どおりの曜日
 
   return (
     <div style={{
