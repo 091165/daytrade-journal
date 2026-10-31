@@ -72,7 +72,7 @@ daytrade-journal/
 
 ## ✅ ルール遵守の振り返り（review.html）
 
-毎朝の判定（[daytrade](https://github.com/okanemochi-banzai/daytrade) の Signal Board）と、実際のトレードを突き合わせるページ。
+毎朝の判定（[daytrade](https://github.com/091165/daytrade) の Signal Board）と、実際のトレードを突き合わせるページ。
 
 - 判定は Signal Board が日付ごとに残す `archive/YYYY-MM-DD.json`（寄り前の版）を読む
   - 既定は同じ GitHub Pages 上の `../daytrade/`。`review.html?signal=https://.../` で差し替え可
