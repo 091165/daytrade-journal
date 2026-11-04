@@ -141,6 +141,25 @@ async function fetchYahoo(code, dateStr) {
   return { symbol, candles };
 }
 
+// その日の日足（始値・高値・安値・終値）。分足は 9:00〜9:05 が欠ける日があるので、寄り値は日足から取る
+async function fetchYahooDay(code, dateStr) {
+  const symbol = `${code}.T`;
+  const [p1, p2] = dateRangeForFetch(dateStr);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?period1=${p1}&period2=${p2}&interval=1d`;
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Linux; X11) AppleWebKit/537.36 daytrade-journal/1.0' },
+  });
+  if (!res.ok) throw new Error(`Yahoo HTTP ${res.status}: ${symbol}`);
+  const result = (await res.json())?.chart?.result?.[0];
+  const ts = result?.timestamp || [];
+  const q = result?.indicators?.quote?.[0] || {};
+  for (let i = 0; i < ts.length; i++) {
+    const d = new Date((ts[i] + 9 * 3600) * 1000).toISOString().slice(0, 10);
+    if (d === dateStr && q.open?.[i] != null) return { o: q.open[i], h: q.high[i], l: q.low[i], c: q.close[i] };
+  }
+  return null;
+}
+
 function filterCandlesForDate(candles, targetDateStr) {
   // Keep only candles within target date + 4 prior days (for BB warmup)
   const targetDate = new Date(targetDateStr + 'T00:00:00Z');
@@ -178,15 +197,31 @@ async function main() {
     for (const code of codes) {
       const outPath = path.join(outDir, `${code}.json`);
       
-      // ★ Skip if file already exists (protect manual data)
+      // ★ Skip if file already exists (protect manual data)。日足（day）がまだなければ、それだけ足す
       if (await fileExists(outPath)) {
-        console.log(`  ⏭  ${code}: existing file kept (skipped)`);
+        const existing = JSON.parse(await fs.readFile(outPath, 'utf-8'));
+        if (existing.day) {
+          console.log(`  ⏭  ${code}: existing file kept (skipped)`);
+          continue;
+        }
+        try {
+          existing.day = await fetchYahooDay(code, csv.date);
+          if (existing.day) {
+            await fs.writeFile(outPath, JSON.stringify(existing));
+            console.log(`  ＋ ${code}: 日足を追加 (始値 ${existing.day.o})`);
+          }
+        } catch (e) {
+          console.error(`  ✗ ${code}: 日足 ${e.message}`);
+        }
+        await sleep(REQUEST_DELAY_MS);
         continue;
       }
       
       try {
         const { symbol, candles } = await fetchYahoo(code, csv.date);
         const filtered = filterCandlesForDate(candles, csv.date);
+        let day = null;
+        try { day = await fetchYahooDay(code, csv.date); } catch (e) { console.error(`  ✗ ${code}: 日足 ${e.message}`); }
         const out = {
           symbol,
           code,
@@ -196,6 +231,7 @@ async function main() {
           source: 'yahoo',
           fetchedAt: new Date().toISOString(),
           candles: filtered,
+          day,
         };
         await fs.writeFile(outPath, JSON.stringify(out));
         console.log(`  ✓ ${code}: ${filtered.length} candles → ${outPath}`);
