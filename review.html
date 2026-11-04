@@ -114,14 +114,36 @@ async function fetchRealTrades(date) {
   const list = [];
   Object.entries(notes.realTrades).forEach(([code, ts]) => {
     ts.forEach(t => list.push({ code, direction: t.direction, qty: t.qty, pnl: t.pnl,
-      openTime: t.openTime || null, closeTime: t.closeTime || null }));
+      openTime: t.openTime || null, closeTime: t.closeTime || null, openPrice: t.openPrice ?? null }));
   });
   return list.length ? list : null;
 }
 
+// その日の株価（data/prices/{date}/{code}.json）。寄り値は日足（day.o）、9:10までの動きは1分足
+async function fetchPrices(date, codes) {
+  const out = {};
+  await Promise.all(codes.map(async code => { out[code] = await fetchJSON(`data/prices/${date}/${code}.json`); }));
+  return out;
+}
+
+const jstHHMM = (t) => new Date((t + 9 * 3600) * 1000).toISOString().slice(11, 16);
+
+// 寄り値・最初の10分の値幅・9:10の値段（decideAt より前の1分足と寄り値から）
+function first10Of(price, decideAt) {
+  if (!price?.day?.o || !price.candles?.length) return null;
+  const date = price.date;
+  const today = price.candles.filter(c => new Date((c.t + 9 * 3600) * 1000).toISOString().slice(0, 10) === date);
+  const before = today.filter(c => jstHHMM(c.t) < decideAt);
+  const at = today.find(c => jstHHMM(c.t) >= decideAt);
+  if (!at) return null;
+  const o = price.day.o;
+  const hi = Math.max(o, ...before.map(c => c.h)), lo = Math.min(o, ...before.map(c => c.l));
+  return { open: o, range: hi - lo, at: at.o, dir: at.o > o ? 'buy' : at.o < o ? 'sell' : null };
+}
+
 // ═══ ルール判定（signal の trading_rules.checks を使う） ═══
 // status: ok / ng / na（記録が足りず判定できない）
-function evaluateDay(checks, csv, realTrades) {
+function evaluateDay(checks, csv, realTrades, prices = {}) {
   const results = [];
   const add = (key, label, status, detail = '') => results.push({ key, label, status, detail });
   const entries = csv ? csv.entries : (realTrades || []);
@@ -174,6 +196,31 @@ function evaluateDay(checks, csv, realTrades) {
     const want = checks.direction === 'buy' ? '買い' : '売り';
     const against = entries.filter(t => t.direction !== checks.direction);
     add('direction', `全部${want}`, against.length ? 'ng' : 'ok', against.length ? `逆向き${against.length}件` : '');
+  }
+
+  // 2026/11/5〜：方向は 9:10 に決める（それより前に入らない／最初の10分が小さい日は順張り／大きく動いた銘柄を逆向きに拾わない）
+  if (checks.decide_at) {
+    const at = checks.decide_at;
+    if (!timed.length) add('decide', `${at}までは入らない`, 'na', '時刻なし');
+    else {
+      const early = timed.filter(t => t.openTime < at);
+      add('decide', `${at}までは入らない`, early.length ? 'ng' : 'ok', early.length ? `${early[0].openTime}に新規など${early.length}件` : '');
+    }
+    const f10 = checks.first10 || {};
+    const judged = timed.filter(t => t.openTime >= at && f10[t.code]);
+    const info = judged.map(t => ({ t, f: first10Of(prices[t.code], at) })).filter(x => x.f);
+    if (!judged.length) add('follow', '最初の10分が小さい日は順張り', 'na', `${at}以降の新規なし`);
+    else if (!info.length) add('follow', '最初の10分が小さい日は順張り', 'na', '株価データなし');
+    else {
+      const bad = info.filter(({ t, f }) => f.range < f10[t.code].small && f.dir && t.direction !== f.dir);
+      add('follow', '最初の10分が小さい日は順張り', bad.length ? 'ng' : 'ok',
+        bad.length ? `${bad[0].t.openTime}に逆向き（最初の10分 ${Math.round(bad[0].f.range)}円）など${bad.length}件` : '');
+      const withPx = info.filter(({ t }) => t.openPrice != null);
+      const knife = withPx.filter(({ t, f }) => (t.direction === 'buy' && t.openPrice < f.open - f10[t.code].knife)
+        || (t.direction === 'sell' && t.openPrice > f.open + f10[t.code].knife));
+      if (withPx.length) add('knife', '大きく動いた銘柄を逆向きに拾わない', knife.length ? 'ng' : 'ok',
+        knife.length ? `${knife[0].t.openTime} 寄りから${Math.round(Math.abs(knife[0].t.openPrice - knife[0].f.open))}円の所で${knife[0].t.direction === 'buy' ? '買い' : '売り'}` : '');
+    }
   }
 
   if (checks.per_trade_stop_yen) {
@@ -251,12 +298,13 @@ function App() {
         const csv = csvText ? parseTradeCSV(csvText) : null;
         const hasTrades = (csv && csv.closes.length > 0) || !!realTrades;
         const checks = signal?.trading_rules?.checks;
+        const prices = checks?.decide_at && realTrades ? await fetchPrices(entry.date, [...new Set(realTrades.map(t => t.code))]) : {};
         return {
           ...entry,
           headline: signal?.trading_rules?.headline,
           trial: checks?.trial,
           hasTrades,
-          eval: hasTrades && checks ? evaluateDay(checks, csv && csv.closes.length ? csv : null, realTrades) : null,
+          eval: hasTrades && checks ? evaluateDay(checks, csv && csv.closes.length ? csv : null, realTrades, prices) : null,
         };
       }));
       setDays(loaded.sort((a, b) => b.date.localeCompare(a.date)));
@@ -377,7 +425,8 @@ function App() {
       <div style={{ fontSize: 10, color: '#475569', lineHeight: 1.7, marginTop: 8 }}>
         ・判定は毎朝の Signal Board の記録（寄り前の版）を使います。<b>推定</b>は記録がなく、判定ラベルから今のルールで組み立て直した日、<b>寄り後</b>は判定が寄り付き後に作られた日です。<br />
         ・時刻が必要なルール（終了時刻・様子見・連敗）は、振り返りメモ（data/日付.json）の実質トレードに時刻がある日だけ判定します。<br />
-        ・「100株まで」「2連敗で終了」は 10/31 以降、どの判定の日も毎日のルールとして判定します（それより前は「手出し無用」の日だけ）。
+        ・「100株まで」「2連敗で終了」は 10/31 以降、どの判定の日も毎日のルールとして判定します（それより前は「手出し無用」の日だけ）。<br />
+        ・11/5 以降は「全部◯◯で統一」の代わりに「9:10までは入らない」「最初の10分が小さい日は順張り」「大きく動いた銘柄を逆向きに拾わない」を判定します（寄り値は日足、最初の10分は1分足から。境目は毎朝の判定ページの値）。
       </div>
     </Page>
   );
