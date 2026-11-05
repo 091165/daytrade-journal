@@ -163,5 +163,10 @@
     "date": "2026-11-04",
     "csv": false,
     "notes": "data/2026-11-04.json"
+  },
+  {
+    "date": "2026-11-05",
+    "csv": false,
+    "notes": "data/2026-11-05.json"
   }
 ]
