@@ -251,7 +251,7 @@ function evaluateDay(checks, csv, realTrades, prices = {}) {
       const sorted = [...timed].sort((a, b) => a.closeTime.localeCompare(b.closeTime));
       let streak = 0, stopAt = null;
       for (const t of sorted) {
-        streak = t.pnl < 0 ? streak + 1 : 0;
+        if (t.pnl < 0) streak += 1; else if (t.pnl > 0) streak = 0;  // 同値は連敗を途切れさせない
         if (streak >= n) { stopAt = t.closeTime; break; }
       }
       const after = stopAt ? timed.filter(t => t.openTime > stopAt) : [];
@@ -267,6 +267,50 @@ function evaluateDay(checks, csv, realTrades, prices = {}) {
     okCount: judged.filter(r => r.status === 'ok').length,
     judgedCount: judged.length,
   };
+}
+
+// ═══ 「止まるはずだった時刻」で、その日の取引を前と後に分ける ═══
+// 止まる時刻：決済を時刻順に見て、N連敗した時点・損益が -上限 に届いた時点・終了時刻 のうち一番早いもの。
+// 同じ時刻の決済はまとめて数える。同値（±0）は連敗を途切れさせない。
+// 「後」＝止まる時刻より後（または同時刻）に新規で入った取引。
+const STOP_RULES = { maxLosses: 2, lossLimit: 10000, endTime: '10:00' };
+const STOP_RULES_SINCE = '2026-10-27';  // 今の「2連敗・-1万円・10時」で取引を始めた日
+
+function splitAtStop(trades, rules = STOP_RULES) {
+  let stop = rules.endTime, why = '終了時刻', cum = 0, streak = 0, low = 0;
+  const closeTimes = [...new Set(trades.map(t => t.closeTime))].sort();
+  let stopped = false;
+  for (const ct of closeTimes) {
+    for (const t of trades.filter(x => x.closeTime === ct)) {
+      cum += t.pnl;
+      if (t.pnl < 0) streak += 1; else if (t.pnl > 0) streak = 0;
+    }
+    low = Math.min(low, cum);
+    if (!stopped && ct < stop && (streak >= rules.maxLosses || cum <= -rules.lossLimit)) {
+      stop = ct; stopped = true;
+      why = [streak >= rules.maxLosses && `${rules.maxLosses}連敗`, cum <= -rules.lossLimit && `-${rules.lossLimit / 10000}万円`].filter(Boolean).join('・');
+    }
+  }
+  const inside = trades.filter(t => t.openTime < stop);
+  const outside = trades.filter(t => t.openTime >= stop);
+  const s = (l) => l.reduce((a, t) => a + t.pnl, 0);
+  // low：その日の損益の一番下（決済ベース）
+  return { stop, why, inside: s(inside), outside: s(outside), outsideCount: outside.length, total: s(trades), low };
+}
+
+// 時刻が一部でも欠けている日は分けられないので、skipped に日付と損益を残す（集計から黙って落とさない）
+async function loadStopDays() {
+  const index = await fetchJSON('data/index.json');
+  if (!index) return { days: [], skipped: [] };
+  const rows = await Promise.all(index.filter(e => e.notes).map(async e => {
+    const trades = await fetchRealTrades(e.date);
+    if (!trades) return null;
+    const total = trades.reduce((s, t) => s + t.pnl, 0);
+    if (!trades.every(t => t.openTime && t.closeTime)) return { skip: true, date: e.date, total };
+    return { date: e.date, n: trades.length, ...splitAtStop(trades) };
+  }));
+  const ok = rows.filter(Boolean).sort((a, b) => a.date.localeCompare(b.date));
+  return { days: ok.filter(r => !r.skip), skipped: ok.filter(r => r.skip) };
 }
 
 function fmtPnL(n) {
@@ -411,6 +455,8 @@ function App() {
         </>
       )}
 
+      <StopCard />
+
       {stats.trial && <TrialCard trial={stats.trial} />}
 
       <Card title="📅 日別" delay="0.4s" action={
@@ -429,6 +475,68 @@ function App() {
         ・11/5 以降は「全部◯◯で統一」の代わりに「9:10までは入らない」「最初の10分が小さい日は順張り」「大きく動いた銘柄を逆向きに拾わない」を判定します（寄り値は日足、最初の10分は1分足から。境目は毎朝の判定ページの値）。
       </div>
     </Page>
+  );
+}
+
+// 止まるはずだった時刻の前と後で損益を分ける（取り返しに行った取引は通算でどうだったか）
+function StopCard() {
+  const [data, setData] = useState(null);
+  const [all, setAll] = useState(false);
+  useEffect(() => { loadStopDays().then(setData).catch(() => setData({ days: [], skipped: [] })); }, []);
+  if (!data || !data.days.length) return null;
+
+  const inRange = (d) => all || d.date >= STOP_RULES_SINCE;
+  const list = data.days.filter(inRange);
+  const skipped = data.skipped.filter(inRange);
+  const cont = list.filter(d => d.outsideCount > 0);
+  const sumOf = (k, l = list) => l.reduce((s, d) => s + d[k], 0);
+  const won = cont.filter(d => d.outside > 0), lost = cont.filter(d => d.outside < 0);
+  const tone = (v) => v >= 0 ? 'good' : 'bad';
+  const pnlStyle = (v, size = 12) => ({ fontSize: size, fontWeight: 700, fontFamily: 'ui-monospace, monospace', color: v >= 0 ? '#4ade80' : '#fb7185' });
+
+  return (
+    <Card title="🛑 止まるはずだった後の損益" delay="0.36s" action={
+      <label style={{ fontSize: 10.5, color: '#64748b', display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+        <input type="checkbox" checked={all} onChange={e => setAll(e.target.checked)} />
+        {STOP_RULES_SINCE.slice(5).replace('-', '/')}より前も
+      </label>}>
+      <div style={{ fontSize: 11.5, color: '#94a3b8', marginBottom: 10, lineHeight: 1.6 }}>
+        {STOP_RULES.maxLosses}連敗・-{STOP_RULES.lossLimit.toLocaleString()}円・{STOP_RULES.endTime} のどれかに当たった時刻で止めていたら、を日ごとに分けた集計（{list.length}日）
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6, marginBottom: 12 }}>
+        <KPI label="ルール内" value={fmtPnL(sumOf('inside'))} sub="円（止まるまで）" tone={tone(sumOf('inside'))} />
+        <KPI label="止まった後" value={fmtPnL(sumOf('outside'))} sub={`円（${cont.length}日）`} tone={tone(sumOf('outside'))} />
+        <KPI label="実際" value={fmtPnL(sumOf('total'))} sub="円" tone={tone(sumOf('total'))} />
+      </div>
+      {cont.length > 0 && (
+        <div style={{ fontSize: 11.5, color: '#94a3b8', marginBottom: 8 }}>
+          続けた{cont.length}日のうち　取り返せた <b style={{ color: '#4ade80' }}>{won.length}日（{fmtPnL(sumOf('outside', won))}円）</b>
+          ／ 広げた <b style={{ color: '#fb7185' }}>{lost.length}日（{fmtPnL(sumOf('outside', lost))}円）</b>
+        </div>
+      )}
+      {cont.length === 0 && <div style={{ fontSize: 12, color: '#4ade80' }}>止まるはずの時刻の後に入った日はありません ✓</div>}
+      {skipped.length > 0 && (
+        <div style={{ fontSize: 11, color: '#fbbf24', marginBottom: 8 }}>
+          時刻が欠けていて分けられない日 {skipped.length}日（実際の損益 計{fmtPnL(skipped.reduce((s, d) => s + d.total, 0))}円）は入っていません：
+          {skipped.map(d => `${d.date.slice(5).replace('-', '/')} ${fmtPnL(d.total)}`).join('、')}
+        </div>
+      )}
+      {[...cont].reverse().map((d, i) => (
+        <Row key={d.date} first={i === 0}
+          left={<a href={`day.html?date=${d.date}`} style={{ color: 'inherit', textDecoration: 'none' }}>
+            <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'ui-monospace, monospace' }}>{d.date.slice(5)}</span>
+            <span style={{ fontSize: 10.5, color: '#64748b', marginLeft: 8 }}>{d.stop} {d.why}で止まるはず → 後に{d.outsideCount}回</span>
+          </a>}
+          right={<span style={{ whiteSpace: 'nowrap', fontSize: 11, color: '#64748b' }}>
+            内 <span style={pnlStyle(d.inside, 11)}>{fmtPnL(d.inside)}</span>
+            {'　'}後 <span style={pnlStyle(d.outside)}>{fmtPnL(d.outside)}</span>
+          </span>} />
+      ))}
+      <div style={{ fontSize: 10, color: '#475569', marginTop: 8, lineHeight: 1.6 }}>
+        ・「ルール内」は止まる時刻より前に入った取引（その時に持っていた分の決済まで含む）。「後」はその時刻以降に新規で入った取引。<br />
+        ・同じ時刻の決済はまとめて数え、同値（±0）は連敗を途切れさせない。振り返りメモに時刻がある日だけ（SBIのCSVだけの日は時刻がないため対象外）。
+      </div>
+    </Card>
   );
 }
 
